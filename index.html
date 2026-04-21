@@ -291,7 +291,7 @@ select.form-input{appearance:none}
   .chat-layout{grid-template-columns:1fr;height:calc(100vh - 140px)}
   .chat-list-panel{position:absolute;left:0;right:0;top:0;bottom:0;background:var(--bg2);z-index:10;display:none}
   .chat-list-panel.show{display:block}
-  .chat-window{height:100%}
+  .chat-window{height:100%;display:flex;flex-direction:column}
   .topbar{flex-wrap:wrap;gap:8px}
   .topbar-title{font-size:18px}
   .search-box{max-width:100%;flex:1 1 100%;order:3}
@@ -316,7 +316,7 @@ select.form-input{appearance:none}
 .mn-item.active{color:var(--accent2)}
 .mn-icon{font-size:20px;margin-bottom:2px}
 .mn-badge{position:absolute;top:6px;right:calc(50% - 14px);background:var(--coral);color:#fff;font-size:9px;font-weight:700;padding:1px 5px;border-radius:10px;line-height:1.4;display:none}
-@media(max-width:640px){.mobile-nav{display:block}}
+@media(max-width:640px){.app-active .mobile-nav{display:block}}
 /* Post owner action buttons */
 .post-owner-btns{display:flex;gap:6px;margin-left:auto}
 .btn-post-edit{padding:4px 10px;border-radius:6px;font-size:11px;font-weight:600;background:var(--accent-dim);color:var(--accent2);border:0.5px solid rgba(124,110,247,.25);cursor:pointer;transition:.2s}
@@ -702,26 +702,29 @@ const S = {
 };
 
 // ═══════════════════════════════════════════════════════════
-//  BOOT — check existing session
+//  BOOT — runs once on page load
 // ═══════════════════════════════════════════════════════════
 (async () => {
-  const setStatus = (msg) => { const s = document.getElementById('boot-status'); if(s) s.textContent = msg; };
-  
-  // Hard timeout — loading screen NEVER shows more than 5 seconds
+  const setStatus = (msg) => { const s = el('boot-status'); if(s) s.textContent = msg; };
+
+  // If the URL has an OAuth code (PKCE callback) or access_token (implicit),
+  // don't show auth screen yet — wait for onAuthStateChange to fire SIGNED_IN.
+  const hasOAuthCallback = location.search.includes('code=') || location.hash.includes('access_token=');
+
+  // Hard timeout — loading screen never shows more than 6s
   const bootTimeout = setTimeout(() => {
-    setStatus('Timed out — showing login');
+    setStatus('Timed out — please sign in');
     hide('loading-screen');
     show('auth-screen', 'flex');
-  }, 5000);
+  }, 6000);
 
   try {
     setStatus('Checking session…');
-    const { data: { session }, error: sessErr } = await sb.auth.getSession();
-    if (sessErr) throw sessErr;
+    const { data: { session } } = await sb.auth.getSession();
     clearTimeout(bootTimeout);
 
     if (session) {
-      setStatus('Session found, loading app…');
+      setStatus('Loading your profile…');
       S.session = session;
       S.user = session.user;
       S.profile = {
@@ -730,21 +733,65 @@ const S = {
       };
       showApp();
       loadProfile().then(() => { updateSidebar(); renderProfile(); });
+    } else if (hasOAuthCallback) {
+      // OAuth code is in URL — Supabase SDK is exchanging it.
+      // onAuthStateChange will fire SIGNED_IN once done. Just wait.
+      setStatus('Completing sign-in…');
+      // Safety net: if SIGNED_IN hasn't fired in 8s, show auth screen
+      setTimeout(() => {
+        if (!S.user) { hide('loading-screen'); show('auth-screen', 'flex'); }
+      }, 8000);
     } else {
-      setStatus('No session');
+      setStatus('');
       hide('loading-screen');
       show('auth-screen', 'flex');
     }
   } catch (e) {
     clearTimeout(bootTimeout);
     console.error('Boot error:', e);
-    setStatus('Error: ' + e.message);
-    setTimeout(() => { hide('loading-screen'); show('auth-screen', 'flex'); }, 1500);
+    hide('loading-screen');
+    show('auth-screen', 'flex');
   }
 })();
 
 // ═══════════════════════════════════════════════════════════
-//  AUTH
+//  AUTH STATE LISTENER
+//  Handles: Google OAuth redirect, token refresh, sign-out
+// ═══════════════════════════════════════════════════════════
+sb.auth.onAuthStateChange(async (event, session) => {
+  if (event === 'SIGNED_IN' && session) {
+    // Only act if app isn't already shown (prevents double-fire on normal login)
+    if (el('app-screen').style.display === 'block') return;
+    S.session = session;
+    S.user = session.user;
+    hide('loading-screen');
+    hide('auth-screen');
+    // Check if new user (needs onboarding) or existing user
+    try {
+      const profile = await apiCall('GET', '/users/me');
+      const isNew = !profile || profile.error || !profile.display_name || (profile.profile_completion_pct || 0) <= 5;
+      if (isNew) {
+        show('onboarding-screen', 'flex');
+      } else {
+        S.profile = profile;
+        showApp();
+      }
+    } catch(e) {
+      console.error('Auth state error:', e);
+      show('onboarding-screen', 'flex');
+    }
+  }
+  if (event === 'TOKEN_REFRESHED' && session) {
+    S.session = session;
+  }
+  if (event === 'SIGNED_OUT') {
+    S.user = null; S.session = null; S.profile = null;
+    document.body.classList.remove('app-active');
+  }
+});
+
+// ═══════════════════════════════════════════════════════════
+//  AUTH FUNCTIONS
 // ═══════════════════════════════════════════════════════════
 function switchTab(mode) {
   S.authMode = mode;
@@ -752,6 +799,10 @@ function switchTab(mode) {
   el('name-group').style.display = mode==='register' ? 'block' : 'none';
   el('auth-title').textContent = mode==='login' ? 'Welcome back' : 'Create your account';
   el('auth-btn').textContent = mode==='login' ? 'Sign in →' : 'Create account →';
+  // Reset auth error styling
+  const ae = el('auth-error');
+  ae.style.cssText = '';
+  ae.classList.remove('show');
 }
 
 async function doAuth() {
@@ -760,54 +811,49 @@ async function doAuth() {
   if (!email || !pass) return showAuthError('Please fill in all fields');
   setLoading('auth-btn', true);
 
-  let result;
   if (S.authMode === 'login') {
-    result = await sb.auth.signInWithPassword({ email, password: pass });
+    const { data, error } = await sb.auth.signInWithPassword({ email, password: pass });
+    setLoading('auth-btn', false);
+    if (error) return showAuthError(error.message);
+    S.session = data.session;
+    S.user = data.user;
+    await loadProfile();
+    showApp();
+
   } else {
     const name = el('inp-name').value.trim();
     if (!name) { setLoading('auth-btn', false); return showAuthError('Please enter your name'); }
-    result = await sb.auth.signUp({ email, password: pass, options: { data: { display_name: name } } });
-  }
-
-  if (result.error) { setLoading('auth-btn', false); return showAuthError(result.error.message); }
-
-  const session = result.data.session;
-  const user = result.data.user || session?.user;
-  if (!user) {
+    const { data, error } = await sb.auth.signUp({
+      email, password: pass,
+      options: { data: { display_name: name } }
+    });
     setLoading('auth-btn', false);
-    return showAuthError('Authentication failed — please try again');
-  }
-  // FIX: when email confirmation is enabled, session is null but user exists — show inbox message
-  if (!session) {
-    setLoading('auth-btn', false);
-    if (S.authMode === 'register') {
-      el('auth-error').style.borderColor = 'rgba(74,222,128,.3)';
-      el('auth-error').style.color = 'var(--green)';
-      el('auth-error').style.background = 'var(--green-dim)';
-      el('auth-error').textContent = '✓ Check your inbox to confirm your email, then sign in.';
-      el('auth-error').classList.add('show');
+    if (error) return showAuthError(error.message);
+
+    // If session is returned immediately (email confirm OFF), go straight to onboarding
+    if (data.session) {
+      S.session = data.session;
+      S.user = data.user;
+      hide('auth-screen');
+      show('onboarding-screen', 'flex');
     } else {
-      showAuthError('Login failed — please try again');
+      // Email confirmation required — show green success message
+      const ae = el('auth-error');
+      ae.style.borderColor = 'rgba(74,222,128,.3)';
+      ae.style.color = 'var(--green)';
+      ae.style.background = 'var(--green-dim)';
+      ae.textContent = '✓ Account created! Check your email to confirm, then sign in.';
+      ae.classList.add('show');
     }
-    return;
-  }
-  S.session = session;
-  S.user = user;
-  setLoading('auth-btn', false);
-
-  if (S.authMode === 'register') {
-    hide('auth-screen');
-    show('onboarding-screen', 'flex');
-  } else {
-    await loadProfile();
-    showApp();
   }
 }
 
 async function doGoogle() {
+  // Use the current page URL as redirectTo so it works on any domain (Netlify, GitHub Pages, etc.)
+  const redirectTo = window.location.href.split('?')[0].split('#')[0];
   const { error } = await sb.auth.signInWithOAuth({
     provider: 'google',
-    options: { redirectTo: window.location.origin }
+    options: { redirectTo }
   });
   if (error) showAuthError(error.message);
 }
@@ -832,41 +878,8 @@ async function verifyOTP() {
   show('onboarding-screen', 'flex');
 }
 
-// Handle OAuth redirect and session changes
-sb.auth.onAuthStateChange(async (event, session) => {
-  // SIGNED_IN fires on Google OAuth redirect back to the app
-  // Only handle it if we don't already have a user (prevents double-fire)
-  if (event === 'SIGNED_IN' && session && !S.user) {
-    S.session = session;
-    S.user = session.user;
-    try {
-      const profile = await apiCall('GET', '/users/me');
-      // New user = no display_name set yet or very low completion
-      const isNew = !profile || profile.error || !profile.display_name || profile.profile_completion_pct <= 10;
-      if (isNew) {
-        hide('loading-screen');
-        hide('auth-screen');
-        show('onboarding-screen', 'flex');
-      } else {
-        S.profile = profile;
-        hide('loading-screen');
-        hide('auth-screen');
-        showApp();
-      }
-    } catch(e) {
-      console.error('OAuth boot error:', e);
-      hide('loading-screen');
-      hide('auth-screen');
-      show('onboarding-screen', 'flex');
-    }
-  }
-  // TOKEN_REFRESHED — update session silently
-  if (event === 'TOKEN_REFRESHED' && session) {
-    S.session = session;
-  }
-});
-
 async function signOut() {
+  document.body.classList.remove('app-active');
   await sb.auth.signOut();
   location.reload();
 }
@@ -906,22 +919,28 @@ async function finishOnboard() {
   if (btn) { btn.disabled = true; btn.textContent = 'Setting up…'; }
 
   try {
+    // Always save roles
     if (S.selectedRoles.length) {
       await apiCall('PUT', '/users/me/roles', { roles: S.selectedRoles });
     }
     const city    = el('ob-city').value.trim();
     const country = el('ob-country').value.trim();
     const bio     = el('ob-bio').value.trim();
-    if (bio || city) {
-      await apiCall('PUT', '/users/me', { bio, location_city: city, location_country: country });
-    }
+    // ALWAYS call PUT /users/me — this upserts the profile row (creates it if new user)
+    // Include display_name from the auth user metadata so new signups save their name
+    const displayName = S.user?.user_metadata?.display_name || S.user?.email?.split('@')[0] || '';
+    await apiCall('PUT', '/users/me', {
+      display_name: displayName,
+      bio: bio || '',
+      location_city: city || '',
+      location_country: country || '',
+    });
     if (S.skills.length) {
       await apiCall('PUT', '/users/me/skills', { skills: S.skills.map(s => ({ skill: s })) });
     }
     await loadProfile();
   } catch(e) {
     console.error('Onboard save error:', e);
-    // Continue anyway — profile can be updated later
   }
 
   if (btn) { btn.disabled = false; }
@@ -953,10 +972,11 @@ function showApp() {
   hide('auth-screen');
   hide('onboarding-screen');
   el('app-screen').style.display = 'block';
+  document.body.classList.add('app-active'); // gates mobile nav — only visible when logged in
   updateSidebar();
   renderProfile();
   setupRealtime();
-  // Load data in background — never blocks showing the UI
+  // Load all data in background — never blocks showing the UI
   Promise.allSettled([
     loadFeed(), loadDiscover(), loadConversations(),
     loadNotifications(), loadBookings(), loadMyPosts()
@@ -1254,27 +1274,32 @@ function renderDiscover(users) {
 function searchDiscover(q) {
   if (!q) { renderDiscover(S.allUsers); return; }
   const low = q.toLowerCase();
-  // Search client-side across already-loaded users first (instant)
+
+  // Instant local filter on already-loaded users
   const local = S.allUsers.filter(u =>
     (u.display_name || '').toLowerCase().includes(low) ||
     (u.bio || '').toLowerCase().includes(low) ||
-    (u.user_skills || []).some(s => s.skill.toLowerCase().includes(low)) ||
-    (u.user_roles  || []).some(r => r.role.toLowerCase().includes(low)) ||
+    (u.user_skills || []).some(s => (s.skill || s).toLowerCase().includes(low)) ||
+    (u.user_roles  || []).some(r => (r.role || r).toLowerCase().includes(low)) ||
     (u.location_city || '').toLowerCase().includes(low)
   );
   renderDiscover(local);
 
-  // Also fire API search for more results not in the current loaded set
+  // Always fire API search (catches users not in current loaded set)
   clearTimeout(S._searchTimer);
   S._searchTimer = setTimeout(async () => {
     const results = await apiCall('GET', `/users/search?q=${encodeURIComponent(q)}&limit=40`);
     if (Array.isArray(results) && results.length) {
-      // Merge with local — deduplicate by id
+      // Merge with local, deduplicate by id
       const ids = new Set(local.map(u => u.id));
-      const extra = results.filter(u => !ids.has(u.id));
-      renderDiscover([...local, ...extra]);
+      const merged = [...local, ...results.filter(u => !ids.has(u.id))];
+      // Also update S.allUsers so subsequent searches are faster
+      merged.forEach(u => { if (!S.allUsers.find(x => x.id === u.id)) S.allUsers.push(u); });
+      renderDiscover(merged);
+    } else if (!local.length) {
+      el('discover-grid').innerHTML = `<div class="empty-state" style="grid-column:1/-1"><div class="empty-icon">🔍</div><div>No users found for "${esc(q)}"</div></div>`;
     }
-  }, 400);
+  }, 300);
 }
 
 function filterRole(role) {
@@ -1286,11 +1311,24 @@ function filterRole(role) {
 // ═══════════════════════════════════════════════════════════
 async function connect(userId, btnEl) {
   if (userId === S.user?.id) return toast('That is you!', 'error');
+  if (S.connections[userId]) return toast('Already connected or request pending', 'info');
+  if (btnEl) { btnEl.disabled = true; btnEl.textContent = '…'; }
   const data = await apiCall('POST', `/connections/request/${userId}`);
-  if (data?.existing) return toast('Already connected or request pending', 'success');
-  S.connections[userId] = true;
-  if (btnEl) { btnEl.textContent = '✓ Sent'; btnEl.classList.add('connected'); }
-  toast('Connection request sent!', 'success');
+  if (btnEl) { btnEl.disabled = false; }
+  if (data && !data.error) {
+    if (data.existing) {
+      toast('Request already sent or already connected', 'success');
+      S.connections[userId] = true;
+      if (btnEl) { btnEl.textContent = '✓ Sent'; btnEl.classList.add('connected'); }
+    } else {
+      S.connections[userId] = true;
+      if (btnEl) { btnEl.textContent = '✓ Sent'; btnEl.classList.add('connected'); }
+      toast('Connection request sent! 🤝', 'success');
+    }
+  } else {
+    if (btnEl) { btnEl.textContent = '+ Connect'; }
+    toast(data?.error || 'Could not send request', 'error');
+  }
 }
 
 // Open booking modal pre-loaded with provider context
@@ -1343,28 +1381,44 @@ async function openConv(convId) {
   S.activeConvId = convId;
   renderConvList();
   openConvMobile(convId);
-  const msgs = await apiCall('GET', `/conversations/${convId}/messages`);
+
   const conv = conversations.find(c=>c.id===convId);
   const other = (conv?.conversation_participants||[]).find(p=>p.user_id!==S.user?.id);
   const name = other?.user_profiles?.display_name || 'User';
+  const otherId = other?.user_id || '';
 
+  // Show window immediately with loading state
   el('chat-window').innerHTML = `
     <div class="chat-hdr">
       <button class="chat-back-btn" onclick="showChatList()">← Back</button>
-      <div class="u-avatar" style="background:linear-gradient(135deg,${randomGrad(other?.user_id||'0')});width:36px;height:36px;font-size:13px">${initials(name)}</div>
-      <div><div style="font-weight:600;font-size:14px">${esc(name)}</div><div class="chat-online">● Active</div></div>
+      <div class="u-avatar" style="background:linear-gradient(135deg,${randomGrad(otherId)});width:36px;height:36px;font-size:13px">${initials(name)}</div>
+      <div>
+        <div style="font-weight:600;font-size:14px">${esc(name)}</div>
+        <div class="chat-online" id="chat-status">Loading…</div>
+      </div>
       <div style="margin-left:auto;display:flex;gap:8px">
-        <button class="btn-outline" style="padding:6px 12px;font-size:12px" onclick="openBookModal('${other?.user_id || ''}','')">📅 Book</button>
+        <button class="btn-outline" style="padding:6px 12px;font-size:12px" onclick="openBookModal('${otherId}','')">📅 Book</button>
       </div>
     </div>
-    <div class="chat-msgs" id="chat-msgs"></div>
+    <div class="chat-msgs" id="chat-msgs"><div style="text-align:center;padding:20px;color:var(--text3);font-size:13px">Loading messages…</div></div>
     <div class="typing-indicator" id="typing-ind" style="display:none"></div>
     <div class="chat-inp">
-      <textarea class="chat-textarea" id="chat-inp" placeholder="Type a message…" onkeydown="chatKey(event,'${convId}')"></textarea>
+      <textarea class="chat-textarea" id="chat-inp" placeholder="Type a message… (Enter to send)" onkeydown="chatKey(event,'${convId}')" oninput="this.style.height='auto';this.style.height=Math.min(this.scrollHeight,100)+'px'"></textarea>
       <button class="chat-send" onclick="sendMsg('${convId}')">↑</button>
     </div>`;
 
-  renderMsgs(msgs||[]);
+  // Load messages
+  const msgs = await apiCall('GET', `/conversations/${convId}/messages`);
+  const statusEl = el('chat-status');
+  if (statusEl) statusEl.textContent = '● Active';
+
+  if (Array.isArray(msgs)) {
+    renderMsgs(msgs);
+  } else {
+    const container = el('chat-msgs');
+    if (container) container.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text3);font-size:13px">No messages yet. Say hello! 👋</div>';
+  }
+
   subscribeToConv(convId);
 }
 
@@ -1388,31 +1442,47 @@ async function sendMsg(convId) {
   const content = inp.value.trim();
   if (!content) return;
   inp.value = '';
+  inp.style.height = 'auto';
 
-  // Optimistic render
+  // Optimistic render in chat window
   const container = el('chat-msgs');
-  const div = document.createElement('div');
-  div.className = 'msg sent';
-  div.innerHTML = `<div class="msg-bubble">${esc(content)}</div><div class="msg-time">now ✓</div>`;
-  container.appendChild(div);
-  container.scrollTop = container.scrollHeight;
+  if (container) {
+    const div = document.createElement('div');
+    div.className = 'msg sent';
+    div.innerHTML = `<div class="msg-bubble">${esc(content)}</div><div class="msg-time">just now ✓</div>`;
+    container.appendChild(div);
+    container.scrollTop = container.scrollHeight;
+  }
 
-  await apiCall('POST', `/conversations/${convId}/messages`, { content, type: 'text' });
+  const data = await apiCall('POST', `/conversations/${convId}/messages`, { content, type: 'text' });
+
+  // Update the conversation preview in the list (no full reload needed)
+  if (data && !data.error) {
+    conversations = conversations.map(c =>
+      c.id === convId
+        ? { ...c, lastMessage: { content, created_at: new Date().toISOString(), sender_id: S.user.id, type: 'text' } }
+        : c
+    );
+    renderConvList();
+  }
 }
 
 function showChatList() {
   const panel = el('chat-list-panel');
   const win = el('chat-window');
-  if (panel) panel.style.display = 'block';
-  if (win) win.style.display = 'none';
+  if (window.innerWidth <= 640) {
+    if (panel) panel.classList.add('show');
+    if (win) win.style.display = 'none';
+  }
   S.activeConvId = null;
+  renderConvList(); // deselect active conv in list
 }
 
 function openConvMobile(convId) {
-  const panel = el('chat-list-panel');
-  const win = el('chat-window');
   if (window.innerWidth <= 640) {
-    if (panel) panel.style.display = 'none';
+    const panel = el('chat-list-panel');
+    const win = el('chat-window');
+    if (panel) panel.classList.remove('show');
     if (win) win.style.display = 'flex';
   }
 }
@@ -1614,28 +1684,41 @@ async function handleNotifClick(event, id, type, data) {
 }
 
 async function acceptConnFromNotif(requestId, notifId) {
+  const btn = event?.target;
+  if (btn) { btn.disabled = true; btn.textContent = '…'; }
   const data = await apiCall('POST', `/connections/accept/${requestId}`);
+  if (btn) { btn.disabled = false; btn.textContent = '✓ Accept'; }
+
   if (data && !data.error) {
-    toast('Connection accepted! You can now chat 🤝', 'success');
+    // Mark notif read
     await apiCall('PUT', `/notifications/${notifId}/read`);
     notifs = notifs.map(n => n.id===notifId ? {...n, is_read:true} : n);
-    updateNotifBadge(); renderNotifs();
+    updateNotifBadge();
+    renderNotifs();
+    toast('Connection accepted! You can now chat 🤝', 'success');
+
+    // Open the conversation that was auto-created on accept
     if (data.conversationId) {
-      await loadConversations();
-      showPage('chat'); setMobileNav('chat');
+      await loadConversations(); // refresh list so new conv appears
+      showPage('chat');
+      setMobileNav('chat');
       openConv(data.conversationId);
     }
   } else {
-    toast(data?.error || 'Could not accept request', 'error');
+    toast(data?.error || 'Could not accept — request may have expired', 'error');
   }
 }
 
 async function rejectConnFromNotif(requestId, notifId) {
-  await apiCall('POST', `/connections/reject/${requestId}`);
+  const btn = event?.target;
+  if (btn) { btn.disabled = true; btn.textContent = '…'; }
+  const data = await apiCall('POST', `/connections/reject/${requestId}`);
+  if (btn) { btn.disabled = false; btn.textContent = '✕ Decline'; }
   await apiCall('PUT', `/notifications/${notifId}/read`);
   notifs = notifs.map(n => n.id===notifId ? {...n, is_read:true} : n);
-  updateNotifBadge(); renderNotifs();
-  toast('Request declined', 'success');
+  updateNotifBadge();
+  renderNotifs();
+  if (!data?.error) toast('Request declined', 'success');
 }
 
 function updateNotifBadge() {
@@ -1999,7 +2082,7 @@ async function apiCall(method, path, body, _retry = false) {
     if (!token) return { error: 'No session — please log in again' };
 
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 12000);
+    const timer = setTimeout(() => controller.abort(), 15000);
     const headers = new Headers();
     headers.set('Content-Type', 'application/json');
     headers.set('Authorization', 'Bearer ' + token);
@@ -2013,16 +2096,15 @@ async function apiCall(method, path, body, _retry = false) {
 
     if (!res.ok) {
       const text = await res.text();
-      console.error('API ' + method + ' ' + path + ' -> ' + res.status + ':', text);
-      try { const j = JSON.parse(text); return { error: j.error || j.message || 'Error ' + res.status }; }
-      catch { return { error: 'Server error ' + res.status + ': ' + text.slice(0, 100) }; }
+      console.error(`API ${method} ${path} → ${res.status}:`, text);
+      try { const j = JSON.parse(text); return { error: j.error || j.message || `Error ${res.status}` }; }
+      catch { return { error: `Server error ${res.status}: ${text.slice(0,100)}` }; }
     }
     return await res.json();
   } catch (e) {
     console.error('API error', method, path, e.message);
-    // FIX: actually retry once on network error (handles cold-starting Edge Functions)
-    if (!_retry) {
-      await new Promise(r => setTimeout(r, 1200));
+    // Only retry on cold-start timeouts (AbortError), not general failures
+    if (!_retry && e.name === 'AbortError') {
       return apiCall(method, path, body, true);
     }
     return { error: e.message };
